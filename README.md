@@ -248,8 +248,12 @@ Don't forget to give the project a star! Thanks again!
 4. Push to the Branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
 
-
-
+## Tests
+You can test your changes by running:
+```sh
+go test
+```
+The tests in the main_test.go file will be run. These tests will need to pass before building a new release.
 
 <!-- LICENSE -->
 ## License

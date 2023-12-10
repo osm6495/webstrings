@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	netUrl "net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -24,12 +25,12 @@ type scriptInfo struct {
 var secretRegex = map[string]string{
 	"Google API Key":                             `AIza[0-9A-Za-z-_]{35}`,
 	"Google OAuth 2.0 Access Token":              `ya29.[0-9A-Za-z-_]+`,
-	"GitHub Personal Access Token (Classic)":     `^ghp_[a-zA-Z0-9]{36}$`,
-	"GitHub Personal Access Token (Fine-Grained": `^github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}$`,
-	"GitHub OAuth 2.0 Access Token":              `^gho_[a-zA-Z0-9]{36}$`,
-	"GitHub User-to-Server Access Token":         `^ghu_[a-zA-Z0-9]{36}$`,
-	"GitHub Server-to-Server Access Token":       `^ghs_[a-zA-Z0-9]{36}$`,
-	"GitHub Refresh Token":                       `^ghr_[a-zA-Z0-9]{36}$`,
+	"GitHub Personal Access Token (Classic)":     `ghp_[a-zA-Z0-9]{36}`,
+	"GitHub Personal Access Token (Fine-Grained": `github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}`,
+	"GitHub OAuth 2.0 Access Token":              `gho_[a-zA-Z0-9]{36}`,
+	"GitHub User-to-Server Access Token":         `ghu_[a-zA-Z0-9]{36}`,
+	"GitHub Server-to-Server Access Token":       `ghs_[a-zA-Z0-9]{36}`,
+	"GitHub Refresh Token":                       `ghr_[a-zA-Z0-9]{36}`,
 	"Foursquare Secret Key":                      `R_[0-9a-f]{32}`,
 	"Picatic API Key":                            `sk_live_[0-9a-z]{32}`,
 	"Stripe Standard API Key":                    `sk_live_[0-9a-zA-Z]{24}`,
@@ -40,7 +41,6 @@ var secretRegex = map[string]string{
 	"Amazon Marketing Services Auth Token":       `amzn.mws.[0-9a-f]{8}-[0-9a-f]{4}-10-9a-f1{4}-[0-9a,]{4}-[0-9a-f]{12}`,
 	"Mailgun API Key":                            `key-[0-9a-zA-Z]{32}`,
 	"MailChimp":                                  `[0-9a-f]{32}-us[0-9]{1,2}`,
-	"Twilio":                                     `55[0-9a-fA-F]{32}`,
 	"Slack OAuth v2 Bot Access Token":            `xoxb-[0-9]{11}-[0-9]{11}-[0-9a-zA-Z]{24}`,
 	"Slack OAuth v2 User Access Token":           `xoxp-[0-9]{11}-[0-9]{11}-[0-9a-zA-Z]{24}`,
 	"Slack OAuth v2 Configuration Token":         `xoxe.xoxp-1-[0-9a-zA-Z]{166}`,
@@ -60,17 +60,18 @@ var secretRegex = map[string]string{
 	"EC Private Key":                             `-----BEGIN EC PRIVATE KEY-----`,
 	"PGP Private Key":                            `-----BEGIN PGP PRIVATE KEY BLOCK-----`,
 	"Generic API Key":                            `[a|A][p|P][i|I][_]?[k|K][e|E][y|Y].*['|\"][0-9a-zA-Z]{32,45}['|\"]`,
-	"Generic Secret":                             `[s|S][e|E][c|C][r|R][e|E][t|T].*['|\"][0-9a-zA-Z]{32,45}['|\"]`,
 	"Password in URL":                            `[a-zA-Z]{3,10}:\\/[^\\s:@]{3,20}:[^\\s:@]{3,20}@.{1,100}[\"'\s]`,
 	"Slack Webhook URL":                          `https://hooks.slack.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}`,
 }
 
 // Return response from getting URL
-func getContents(url string) (*string, string, error) {
-	if url[:2] == "//" {
-		url = "https:" + url
-	} else if url == "" {
+func getContents(url string, baseUrl string) (*string, string, error) {
+	if url == "" {
 		return nil, url, fmt.Errorf("Attempted to get contents of empty URL")
+	} else if url[:2] == "//" {
+		url = "https:" + url
+	} else if url[:1] == "/" {
+		url = baseUrl + url
 	}
 
 	res, err := http.Get(url)
@@ -98,7 +99,15 @@ func getContents(url string) (*string, string, error) {
 }
 
 // Gets the list of script src links from the HTML response of the original URL
-func getScripts(url string) ([]string, error) {
+func getScripts(url string, baseUrl string) ([]string, error) {
+	if url == "" {
+		return nil, fmt.Errorf("Attempted to get contents of empty URL")
+	} else if url[:2] == "//" {
+		url = "https:" + url
+	} else if url[:1] == "/" {
+		url = baseUrl + url
+	}
+
 	res, err := http.Get(url)
 	if err != nil {
 		return nil, err
@@ -233,13 +242,31 @@ func getStrings(text string, flags map[string]bool) ([]string, error) {
 	}
 
 	if inString {
+		if flags["noisy"] {
+			result = append(result, currentString)
+		} else {
+			//Compile the regex patterns to check for unwanted minified js code
+			functionPattern := regexp.MustCompile(`function\(`)
+			varPattern := regexp.MustCompile(`\bvar\b`)
+			returnPattern := regexp.MustCompile(`\breturn\b`)
+
+			functionMatch := functionPattern.MatchString(currentString)
+			varMatch := varPattern.MatchString(currentString)
+			returnMatch := returnPattern.MatchString(currentString)
+
+			//Only add the string if it does not contain minified js code
+			if !(functionMatch && varMatch && returnMatch) {
+				result = append(result, currentString)
+			}
+		}
+
 		result = append(result, currentString)
 	}
 
 	return result, nil
 }
 
-func getSecrets(text string, flags map[string]bool) map[string]string {
+func getSecrets(text string, flags map[string]bool) map[string][]string {
 	//If the user enables the urls flag, we will search for URLs as well
 	if flags["urls"] && flags["noisy"] {
 		//Use the noisy URL regex pattern (Does not require http(s)://)
@@ -253,15 +280,33 @@ func getSecrets(text string, flags map[string]bool) map[string]string {
 		secretRegex["Google Cloud Platform API Key"] = `[A-Za-z0-9_]{21}--[A-Za-z0-9_]{8}`
 		secretRegex["Heroku API Key"] = `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`
 		secretRegex["Google OAuth 2.0 Refresh Token"] = `1/[0-9A-Za-z-]{43}|1/[0-9A-Za-z-]{64}`
+		secretRegex["Generic Secret"] = `[s|S][e|E][c|C][r|R][e|E][t|T].*['|\"][0-9a-zA-Z]{32,45}['|\"]`
+		secretRegex["Twilio"] = `55[0-9a-fA-F]{32}`
 	}
 
+	//Compile the regex patterns to check for unwanted minified js code
+	functionPattern := regexp.MustCompile(`function\(`)
+	varPattern := regexp.MustCompile(`\bvar\b`)
+	returnPattern := regexp.MustCompile(`\breturn\b`)
+
 	//Search the provided text for any matches to the list of regex patterns
-	var results = map[string]string{}
+	var results = map[string][]string{}
 	for description, regex := range secretRegex {
 		re := regexp.MustCompile(regex)
 		matches := re.FindAllString(text, -1)
 		for _, match := range matches {
-			results[description] = match
+			if flags["noisy"] {
+				results[description] = append(results[description], match)
+			} else {
+				functionMatch := functionPattern.MatchString(match)
+				varMatch := varPattern.MatchString(match)
+				returnMatch := returnPattern.MatchString(match)
+
+				//Only add the match if it does not contain minified js code
+				if !(functionMatch && varMatch && returnMatch) {
+					results[description] = append(results[description], match)
+				}
+			}
 		}
 	}
 	return results
@@ -280,7 +325,7 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 		if scripts != nil {
 			//For each script source, go to the page and search for strings
 			for _, script := range scripts {
-				text, currUrl, err := getContents(script)
+				text, currUrl, err := getContents(script, url)
 				if err != nil {
 					return nil, err
 				}
@@ -302,7 +347,7 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 		}
 		if inline != nil {
 			//Search the inline scripts for any strings
-			text, currUrl, err := getContents(*inline)
+			text, currUrl, err := getContents(*inline, url)
 			if err != nil {
 				return nil, err
 			}
@@ -325,7 +370,7 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 		return strings, nil
 		//If the dom flag is not set we will get the list of scripts from the HTML response
 	} else {
-		scripts, err := getScripts(url)
+		scripts, err := getScripts(url, url)
 		if err != nil {
 			return nil, err
 		}
@@ -334,7 +379,7 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 		if scripts != nil {
 			//For each script source, go to the page and search for strings
 			for _, script := range scripts {
-				text, currUrl, err := getContents(script)
+				text, currUrl, err := getContents(script, url)
 				if err != nil {
 					return nil, err
 				}
@@ -373,12 +418,33 @@ func secretsCheck(url string, flags map[string]bool) ([]string, error) {
 		if scripts != nil {
 			//For each script source, go to the page and search for secrets
 			for _, script := range scripts {
-				text, currUrl, err := getContents(script)
+				text, currUrl, err := getContents(script, url)
 				if err != nil {
 					return nil, err
 				}
 				s := getSecrets(*text, flags)
-				for description, finding := range s {
+				for description, findings := range s {
+					for _, finding := range findings {
+						var location string
+						if !flags["verify"] {
+							location = ""
+						} else {
+							location = " (Location: " + currUrl + ")"
+						}
+						strings = append(strings, "Possible "+description+" found: "+finding+location)
+					}
+				}
+			}
+		}
+		if inline != nil {
+			//Search for secrets in inline scripts
+			text, currUrl, err := getContents(*inline, url)
+			if err != nil {
+				return nil, err
+			}
+			s := getSecrets(*text, flags)
+			for description, findings := range s {
+				for _, finding := range findings {
 					var location string
 					if !flags["verify"] {
 						location = ""
@@ -389,28 +455,11 @@ func secretsCheck(url string, flags map[string]bool) ([]string, error) {
 				}
 			}
 		}
-		if inline != nil {
-			//Search for secrets in inline scripts
-			text, currUrl, err := getContents(*inline)
-			if err != nil {
-				return nil, err
-			}
-			s := getSecrets(*text, flags)
-			for description, finding := range s {
-				var location string
-				if !flags["verify"] {
-					location = ""
-				} else {
-					location = " (Location: " + currUrl + ")"
-				}
-				strings = append(strings, "Possible "+description+" found: "+finding+location)
-			}
-		}
 
 		return strings, nil
 	} else {
 		//If the dom flag is not set we will get the list of scripts from the HTML response
-		scripts, err := getScripts(url)
+		scripts, err := getScripts(url, url)
 		if err != nil {
 			return nil, err
 		}
@@ -420,19 +469,21 @@ func secretsCheck(url string, flags map[string]bool) ([]string, error) {
 		if scripts != nil {
 			//For each script source, go to the page and search for secrets
 			for _, script := range scripts {
-				text, currUrl, err := getContents(script)
+				text, currUrl, err := getContents(script, url)
 				if err != nil {
 					return nil, err
 				}
 				s := getSecrets(*text, flags)
-				for description, finding := range s {
-					var location string
-					if !flags["verify"] {
-						location = ""
-					} else {
-						location = " (Location: " + currUrl + ")"
+				for description, findings := range s {
+					for _, finding := range findings {
+						var location string
+						if !flags["verify"] {
+							location = ""
+						} else {
+							location = " (Location: " + currUrl + ")"
+						}
+						strings = append(strings, "Possible "+description+" found: "+finding+location)
 					}
-					strings = append(strings, "Possible "+description+" found: "+finding+location)
 				}
 			}
 		}
@@ -555,6 +606,15 @@ func main() {
 
 				if url == "" {
 					return fmt.Errorf("no URL provided")
+				}
+
+				parsedUrl, err := netUrl.Parse(url)
+				if err != nil {
+					return err
+				}
+
+				if parsedUrl.Scheme == "" {
+					url = "https://" + url
 				}
 
 				strings, err := run(url, flags)
