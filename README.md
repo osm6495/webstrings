@@ -99,6 +99,22 @@ You can also install with Golang:
     ```
     go install github.com/osm6495/webstrings@latest
     ```
+2. If the go install command is successful, but `webstrings -h` results in a `webstrings: command not found`, verify that your GOPATH is setup correctly. You can check your GOPATH with:
+    ```sh
+    go env GOPATH
+    ```
+3. If you are running into that issue, chances are if you add `/bin/webstrings` to that GOPATH you will be able to run the installed binary just fine. To add your GOPATH to your PATH so that you can run the binary like a normal command, open your shell profile (e.g., ~/.bashrc, ~/.zshrc, ~/.bash_profile) with whatever text editor you like:
+    ```sh
+    nano ~/.bashrc
+    ```
+4. Add this line to the end of that file to add your GOPATH to your shell's PATH:
+   ```sh
+   export PATH=$PATH:/home/owen/go/bin
+   ```
+5. Restart your teminal or run this command to apply the changes:
+   ```sh
+   source ~/.bashrc
+   ```
 ----
 If you would like to build from the source code instead, that process is easy as well:
 1. You'll need Golang installed. If you don't already have it you can get it from the [website](https://go.dev/dl/) or use your package manager, like apt on linux:
