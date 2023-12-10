@@ -2,8 +2,8 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
+        required: true
         description: "What will the version tag be?"
-        default: ${{ github.ref }}
       prerelease:
         type: boolean
         description: "Is this release a pre-release that is not ready for production use?"
