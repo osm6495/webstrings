@@ -27,7 +27,7 @@
   <h3 align="center">WebStrings</h3>
 
   <p align="center">
-    An awesome README template to jumpstart your projects!
+    Find strings and secrets in client-side web code
     <br />
     <a href="https://github.com/osm6495/webstrings"><strong>Report Bug or Request Feature»</strong></a>
   </p>
