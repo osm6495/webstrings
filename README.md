@@ -241,7 +241,7 @@ To find where your secret finding is in the webpage:
 - [ ] File Output Formats
     - This can currently be done by piping the output of the CLI to a file:<br>`webstrings "https://example.com" > out.txt`
     - Would be nice to have JSON and other formats, as well as options for keeping progress output in the console and only outputting findings to the file
-- [] Better minified JS parsing
+- [ ] Better minified JS parsing
     - Minified JS often ends up outputting huge chunks of JS code rather than actual strings, quotes and other delimiters are sometimes inaccurate. Would need to find another way to parse this, maybe some kind of AST.
 - [ ] Allow regex input files to add secret patterns
 
