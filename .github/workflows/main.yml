@@ -39,10 +39,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.event.input.tag_name }}
-          release_name: Release ${{ github.event.input.tag_name }}
+          tag_name: ${{ github.event.inputs.tag_name }}
+          release_name: Release ${{ github.event.inputs.tag_name }}
           draft: false
-          prerelease: ${{ github.event.input.prerealease }}
+          prerelease: ${{ github.event.inputs.prerealease }}
       
       - name: Upload Binary Release Asset
         id: upload-release-asset 
