@@ -276,6 +276,11 @@ The tests in the main_test.go file will be run. These tests will need to pass be
 
 Distributed under the MIT License. See `LICENSE.txt` for more information.
 
+## Acknowledgements
+- Regex Patterns:
+  - https://github.com/odomojuli/regextokens
+  - https://github.com/h33tlit/secret-regex-list
+
 
 
 
