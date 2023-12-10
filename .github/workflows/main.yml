@@ -9,7 +9,7 @@ on:
         description: "Is this release a pre-release that is not ready for production use?"
         default: true
 
-name: Release Vesion
+name: Release Version
 
 jobs:
   build:
