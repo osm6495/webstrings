@@ -278,6 +278,7 @@ Distributed under the MIT License. See `LICENSE.txt` for more information.
 
 ## Acknowledgements
 - Regex Patterns:
+  - https://github.com/dxa4481/truffleHogRegexes/blob/master/truffleHogRegexes/regexes.json
   - https://github.com/odomojuli/regextokens
   - https://github.com/h33tlit/secret-regex-list
 
