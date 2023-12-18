@@ -65,47 +65,65 @@ var secretRegex = map[string]string{
 }
 
 // Return response from getting URL
-func getContents(url string, baseUrl string) (*string, string, error) {
+func getContents(url string, baseUrl string) (*string, *string, error) {
 	if url == "" {
-		return nil, url, fmt.Errorf("Attempted to get contents of empty URL")
-	} else if url[:2] == "//" {
-		url = "https:" + url
+		return nil, &url, fmt.Errorf("Attempted to get contents of empty URL")
 	} else if url[:1] == "/" {
 		url = baseUrl + url
 	}
 
+	//Needs to come after the if statement above to allow relative URLS, otherwise they will get prefixed with https://
+	parsedUrl, err := netUrl.Parse(url)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if parsedUrl.Scheme == "" {
+		url = "https://" + url
+	}
+
 	res, err := http.Get(url)
 	if err != nil {
-		return nil, url, err
+		return nil, nil, err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return nil, url, fmt.Errorf("status code error: %d %s", res.StatusCode, res.Status)
+		//Non-breaking error
+		fmt.Printf("Warning: Attempted HTTP GET of %s returned status code error: %s\n", url, res.Status)
+		return nil, nil, nil
 	}
 
 	// Read the entire text into a string
 	bytes, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, url, err
+		return nil, nil, err
 	}
 
 	textString := string(bytes)
 	if err != nil {
-		return nil, url, err
+		return nil, nil, err
 	}
 
-	return &textString, url, nil
+	return &textString, &url, nil
 }
 
 // Gets the list of script src links from the HTML response of the original URL
 func getScripts(url string, baseUrl string) ([]string, error) {
 	if url == "" {
 		return nil, fmt.Errorf("Attempted to get contents of empty URL")
-	} else if url[:2] == "//" {
-		url = "https:" + url
 	} else if url[:1] == "/" {
 		url = baseUrl + url
+	}
+
+	//Needs to come after the if statement above to allow relative URLS, otherwise they will get prefixed with https://
+	parsedUrl, err := netUrl.Parse(url)
+	if err != nil {
+		return nil, err
+	}
+
+	if parsedUrl.Scheme == "" {
+		url = "https://" + url
 	}
 
 	res, err := http.Get(url)
@@ -115,7 +133,9 @@ func getScripts(url string, baseUrl string) ([]string, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("status code error: %d %s", res.StatusCode, res.Status)
+		//Non-breaking error
+		fmt.Printf("Warning: Attempted HTTP GET of %s returned status code error: %s\n", url, res.Status)
+		return nil, nil
 	}
 
 	doc, err := goquery.NewDocumentFromReader(res.Body)
@@ -329,6 +349,10 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 				if err != nil {
 					return nil, err
 				}
+				//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
+				if text == nil {
+					return nil, nil
+				}
 				s, err := getStrings(*text, flags)
 				if err != nil {
 					return nil, err
@@ -339,7 +363,7 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 					if !flags["verify"] {
 						location = ""
 					} else {
-						location = " (Location: " + currUrl + ")"
+						location = " (Location: " + *currUrl + ")"
 					}
 					strings = append(strings, str+location)
 				}
@@ -351,6 +375,10 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 			if err != nil {
 				return nil, err
 			}
+			//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
+			if text == nil {
+				return nil, nil
+			}
 			s, err := getStrings(*text, flags)
 			if err != nil {
 				return nil, err
@@ -361,7 +389,7 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 				if !flags["verify"] {
 					location = ""
 				} else {
-					location = " (Location: " + currUrl + ")"
+					location = " (Location: " + *currUrl + ")"
 				}
 				strings = append(strings, str+location)
 			}
@@ -383,6 +411,10 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 				if err != nil {
 					return nil, err
 				}
+				//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
+				if text == nil {
+					return nil, nil
+				}
 				s, err := getStrings(*text, flags)
 				if err != nil {
 					return nil, err
@@ -393,7 +425,7 @@ func stringsCheck(url string, flags map[string]bool) ([]string, error) {
 					if !flags["verify"] {
 						location = ""
 					} else {
-						location = " (Location: " + currUrl + ")"
+						location = " (Location: " + *currUrl + ")"
 					}
 					strings = append(strings, str+location)
 				}
@@ -422,6 +454,10 @@ func secretsCheck(url string, flags map[string]bool) ([]string, error) {
 				if err != nil {
 					return nil, err
 				}
+				//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
+				if text == nil {
+					return nil, nil
+				}
 				s := getSecrets(*text, flags)
 				for description, findings := range s {
 					for _, finding := range findings {
@@ -429,7 +465,7 @@ func secretsCheck(url string, flags map[string]bool) ([]string, error) {
 						if !flags["verify"] {
 							location = ""
 						} else {
-							location = " (Location: " + currUrl + ")"
+							location = " (Location: " + *currUrl + ")"
 						}
 						strings = append(strings, "Possible "+description+" found: "+finding+location)
 					}
@@ -449,7 +485,7 @@ func secretsCheck(url string, flags map[string]bool) ([]string, error) {
 					if !flags["verify"] {
 						location = ""
 					} else {
-						location = " (Location: " + currUrl + ")"
+						location = " (Location: " + *currUrl + ")"
 					}
 					strings = append(strings, "Possible "+description+" found: "+finding+location)
 				}
@@ -473,6 +509,10 @@ func secretsCheck(url string, flags map[string]bool) ([]string, error) {
 				if err != nil {
 					return nil, err
 				}
+				//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
+				if text == nil {
+					return nil, nil
+				}
 				s := getSecrets(*text, flags)
 				for description, findings := range s {
 					for _, finding := range findings {
@@ -480,7 +520,7 @@ func secretsCheck(url string, flags map[string]bool) ([]string, error) {
 						if !flags["verify"] {
 							location = ""
 						} else {
-							location = " (Location: " + currUrl + ")"
+							location = " (Location: " + *currUrl + ")"
 						}
 						strings = append(strings, "Possible "+description+" found: "+finding+location)
 					}
