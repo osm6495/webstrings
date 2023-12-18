@@ -109,7 +109,7 @@ You can also install with Golang:
     ```
 4. Add this line to the end of that file to add your GOPATH to your shell's PATH:
    ```sh
-   export PATH=$PATH:/home/owen/go/bin
+   export PATH=$PATH:{your GOPATH fom step 2}
    ```
 5. Restart your teminal or run this command to apply the changes:
    ```sh
