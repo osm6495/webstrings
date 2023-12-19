@@ -10,17 +10,43 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/chromedp/chromedp"
+	"github.com/sourcegraph/conc/pool"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/time/rate"
 )
 
 type scriptInfo struct {
 	Src     string `json:"src"`
 	Content string `json:"content"`
 }
+
+type URLQueue struct {
+	mu    sync.Mutex
+	queue []string
+}
+
+func (q *URLQueue) Push(url string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.queue = append(q.queue, url)
+}
+
+func (q *URLQueue) Pop() string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.queue) == 0 {
+		return ""
+	}
+	url := q.queue[0]
+	q.queue = q.queue[1:]
+	return url
+}
+
+var outputMutex = sync.Mutex{}
 
 var secretRegex = map[string]string{
 	"Google API Key":                             `AIza[0-9A-Za-z-_]{35}`,
@@ -64,10 +90,20 @@ var secretRegex = map[string]string{
 	"Slack Webhook URL":                          `https://hooks.slack.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}`,
 }
 
-// Return response from getting URL
-func getContents(url string, baseUrl string) (*string, *string, error) {
+// getContents connects to the URL and gets the page contents
+//
+// Parameters:
+//   - ctx: The context for the search, used to cancel the search if needed and to create the HTTP request.
+//   - url: The URL to search.
+//   - baseUrl: The base URL to use if the URL is a relative URL.
+//
+// Returns:
+//   - *string: A pointer to a string containing the page content.
+//   - error
+func getContents(ctx context.Context, url string, baseUrl string) (*string, error) {
 	if url == "" {
-		return nil, &url, fmt.Errorf("Attempted to get contents of empty URL")
+		return nil, fmt.Errorf("Attempted to get contents of empty URL")
+		//Check if the URL is a relative URL, if so, append the base URL
 	} else if url[:1] == "/" {
 		url = baseUrl + url
 	}
@@ -75,70 +111,60 @@ func getContents(url string, baseUrl string) (*string, *string, error) {
 	//Needs to come after the if statement above to allow relative URLS, otherwise they will get prefixed with https://
 	parsedUrl, err := netUrl.Parse(url)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if parsedUrl.Scheme == "" {
+		baseUrl = "https://" + url
 		url = "https://" + url
 	}
 
-	res, err := http.Get(url)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, nil, err
+		fmt.Printf("Warning - Attempted HTTP GET request creation of %s failed: %s", url, err)
+		return nil, nil
+	}
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Printf("Warning - Attempted HTTP GET of %s failed: %s", url, err)
+		return nil, nil
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
 		//Non-breaking error
-		fmt.Printf("Warning: Attempted HTTP GET of %s returned status code error: %s\n", url, res.Status)
-		return nil, nil, nil
+		fmt.Printf("Warning - Attempted HTTP GET of %s returned status code error: %s\n", url, res.Status)
+		return nil, nil
 	}
 
 	// Read the entire text into a string
 	bytes, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	textString := string(bytes)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return &textString, &url, nil
+	return &textString, nil
 }
 
-// Gets the list of script src links from the HTML response of the original URL
-func getScripts(url string, baseUrl string) ([]string, error) {
-	if url == "" {
-		return nil, fmt.Errorf("Attempted to get contents of empty URL")
-	} else if url[:1] == "/" {
-		url = baseUrl + url
-	}
+// getScripts get the list of script source links from the HTML of the input text
+//
+// Parameters:
+//   - textString: A pointer to a string containing the page content to search.
+//
+// Returns:
+//   - []string: A slice of strings containing the script source links.
+//   - error
+func getScripts(textString *string) ([]string, error) {
+	body := strings.NewReader(*textString)
 
-	//Needs to come after the if statement above to allow relative URLS, otherwise they will get prefixed with https://
-	parsedUrl, err := netUrl.Parse(url)
-	if err != nil {
-		return nil, err
-	}
-
-	if parsedUrl.Scheme == "" {
-		url = "https://" + url
-	}
-
-	res, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != 200 {
-		//Non-breaking error
-		fmt.Printf("Warning: Attempted HTTP GET of %s returned status code error: %s\n", url, res.Status)
-		return nil, nil
-	}
-
-	doc, err := goquery.NewDocumentFromReader(res.Body)
+	//goquery is used to search for script tags with src attributes
+	doc, err := goquery.NewDocumentFromReader(body)
 	if err != nil {
 		return nil, err
 	}
@@ -154,29 +180,22 @@ func getScripts(url string, baseUrl string) ([]string, error) {
 	return scripts, nil
 }
 
-// Return the script sources from the DOM
-func getDOM(url string) ([]string, *string, error) {
+// getDom opens a headless browser and navigates to the provided URL, then gets the script source links and inline scripts from the DOM
+//
+// This uses chromedp to get the script source links, but if it is possible to get the page contents with the same request that gets the DOM it is possible to reduce
+// the number of requests needed, since currently getContents is still required in the search function when searching for secrets
+//
+// Parameters:
+//   - parentCtx: The context for the search, used to cancel the search if needed and to pass to the chromedp context
+//   - url: The URL to search.
+//
+// Returns:
+//   - []string: A slice of strings containing the script source links.
+//   - *string: A pointer to a string containing the inline script.
+//   - error
+func getDOM(parentCtx context.Context, url string) ([]string, *string, error) {
 	// Create a chromedp context
-	ctx, cancel := chromedp.NewContext(context.Background())
-	defer cancel()
-
-	// Set Chrome options for headless execution
-	options := []chromedp.ExecAllocatorOption{
-		chromedp.NoFirstRun,
-		chromedp.NoDefaultBrowserCheck,
-		chromedp.Headless,
-	}
-
-	// Create an allocator with the given options
-	allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, options...)
-	defer allocCancel()
-
-	// Use the allocator context to create a new chromedp context
-	taskCtx, taskCancel := chromedp.NewContext(allocCtx)
-	defer taskCancel()
-
-	// Run a series of tasks with a timeout to ensure proper shutdown
-	ctx, cancel = context.WithTimeout(taskCtx, 10*time.Second)
+	ctx, cancel := chromedp.NewContext(parentCtx)
 	defer cancel()
 
 	// Navigate to the page and get the list of script information (src and content)
@@ -214,6 +233,14 @@ func getDOM(url string) ([]string, *string, error) {
 	}
 }
 
+// getStrings is the function that takes in the content from a URL response or inline script and searches for strings
+//
+// Parameters:
+//   - text: The text to search for strings.
+//   - flags: The flags that the user input when using the CLI.
+//
+// Returns:
+//   - []string: A slice of strings containing the findings.
 func getStrings(text string, flags map[string]bool) ([]string, error) {
 	inString := false
 	currentString := ""
@@ -286,8 +313,17 @@ func getStrings(text string, flags map[string]bool) ([]string, error) {
 	return result, nil
 }
 
+// getSecrets is the function that takes in the content from a URL response or inline script and searches for secrets using regex patterns
+//
+// Parameters:
+//   - text: The text to search for secrets.
+//   - flags: The flags that the user input when using the CLI.
+//
+// Returns:
+//   - map[string][]string: A map of the secret description to a slice of strings containing the findings.
+//     Example: {"URL": ["https://example.com", "https://example2.com"], "GitHub Personal Access Token (Classic)": ["ghp_123456789023456789012345678902345678"]}
 func getSecrets(text string, flags map[string]bool) map[string][]string {
-	//If the user enables the urls flag, we will search for URLs as well
+	//If the user enables the urls flag, we will append a URL regex to the global regex map
 	if flags["urls"] && flags["noisy"] {
 		//Use the noisy URL regex pattern (Does not require http(s)://)
 		secretRegex["URL"] = `(http(s)?:\/\/.)?(www\.)?[-a-zA-Z0-9@:%._\+~#=]{2,256}\.[a-z]{2,6}\b([-a-zA-Z0-9@:%_\+.~#?&//=]*)`
@@ -332,212 +368,191 @@ func getSecrets(text string, flags map[string]bool) map[string][]string {
 	return results
 }
 
-func stringsCheck(url string, flags map[string]bool) ([]string, error) {
-	//If the dom flag is set, we will search the DOM for strings
-	if flags["dom"] {
-		//Get the list of script sources from the DOM
-		scripts, inline, err := getDOM(url)
-		if err != nil {
-			return nil, err
-		}
-
-		var strings []string
-		if scripts != nil {
-			//For each script source, go to the page and search for strings
-			for _, script := range scripts {
-				text, currUrl, err := getContents(script, url)
-				if err != nil {
-					return nil, err
-				}
-				//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
-				if text == nil {
-					return nil, nil
-				}
-				s, err := getStrings(*text, flags)
-				if err != nil {
-					return nil, err
-				}
-
-				for _, str := range s {
-					var location string
-					if !flags["verify"] {
-						location = ""
-					} else {
-						location = " (Location: " + *currUrl + ")"
-					}
-					strings = append(strings, str+location)
-				}
-			}
-		}
-		if inline != nil {
-			//Search the inline scripts for any strings
-			text, currUrl, err := getContents(*inline, url)
-			if err != nil {
-				return nil, err
-			}
-			//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
-			if text == nil {
-				return nil, nil
-			}
-			s, err := getStrings(*text, flags)
-			if err != nil {
-				return nil, err
-			}
-
-			for _, str := range s {
-				var location string
-				if !flags["verify"] {
-					location = ""
-				} else {
-					location = " (Location: " + *currUrl + ")"
-				}
-				strings = append(strings, str+location)
-			}
-		}
-
-		return strings, nil
-		//If the dom flag is not set we will get the list of scripts from the HTML response
-	} else {
-		scripts, err := getScripts(url, url)
-		if err != nil {
-			return nil, err
-		}
-
-		var strings []string
-		if scripts != nil {
-			//For each script source, go to the page and search for strings
-			for _, script := range scripts {
-				text, currUrl, err := getContents(script, url)
-				if err != nil {
-					return nil, err
-				}
-				//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
-				if text == nil {
-					return nil, nil
-				}
-				s, err := getStrings(*text, flags)
-				if err != nil {
-					return nil, err
-				}
-
-				for _, str := range s {
-					var location string
-					if !flags["verify"] {
-						location = ""
-					} else {
-						location = " (Location: " + *currUrl + ")"
-					}
-					strings = append(strings, str+location)
-				}
-			}
-		}
-
-		return strings, nil
+// The search function searches a URL for strings or secrets
+//
+// This is the function that handles the logic for doing different searches for strings or secrets based
+// on the flags provided by the user. It also handles the logic for searching the DOM if the user enables
+// the dom flag.
+//
+// Parameters:
+//   - ctx: The context for the search, used to cancel the search if needed and to pass to other functions.
+//   - url: The URL to search.
+//   - flags: The flags that the user input when using the CLI.
+//   - urlQueue: A pointer to the URLQueue with the input URLs or any found during the search.
+//
+// Returns:
+//   - []string: A slice of strings containing the results of the search.
+//   - error
+func search(ctx context.Context, url string, flags map[string]bool, urlQueue *URLQueue) ([]string, error) {
+	var out []string
+	if url == "" {
+		return nil, fmt.Errorf("Attempted to search empty URL")
 	}
-}
 
-func secretsCheck(url string, flags map[string]bool) ([]string, error) {
-	//If the dom flag is set, we will search the DOM for secrets
+	textString, err := getContents(ctx, url, url)
+	if err != nil {
+		return nil, err
+	}
+
+	var inline *string
+	var scripts []string
 	if flags["dom"] {
-		//Get the list of script sources from the DOM
-		scripts, inline, err := getDOM(url)
+		//Currently getDOM can ONLY be used to get script sources, so both getContents and getDOM must be used
+		scripts, inline, err = getDOM(ctx, url)
 		if err != nil {
 			return nil, err
 		}
-		scripts = append(scripts, url) //We will also check the original page, which means inline scripts will be checked as well
 
-		var strings []string
 		if scripts != nil {
-			//For each script source, go to the page and search for secrets
 			for _, script := range scripts {
-				text, currUrl, err := getContents(script, url)
-				if err != nil {
-					return nil, err
+				//Check if the script is a relative URL, if so, append the base URL
+				if script[:1] == "/" {
+					script = url + script
 				}
-				//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
-				if text == nil {
-					return nil, nil
+				urlQueue.Push(script)
+			}
+		}
+	} else {
+		scripts, err := getScripts(textString)
+		if err != nil {
+			return nil, err
+		}
+		if scripts != nil {
+			for _, script := range scripts {
+				//Check if the script is a relative URL, if so, append the base URL
+				if script[:1] == "/" {
+					script = url + script
 				}
-				s := getSecrets(*text, flags)
-				for description, findings := range s {
-					for _, finding := range findings {
-						var location string
-						if !flags["verify"] {
-							location = ""
-						} else {
-							location = " (Location: " + *currUrl + ")"
-						}
-						strings = append(strings, "Possible "+description+" found: "+finding+location)
+				urlQueue.Push(script)
+			}
+		}
+	}
+
+	if flags["secrets"] {
+		var s map[string][]string
+		//getContent can return a nil pointer if the request fails
+		if textString != nil {
+			s = getSecrets(*textString, flags)
+		}
+
+		//Append inline findings to the output as well
+		if inline != nil {
+			s2 := getSecrets(*inline, flags)
+			if s2 != nil {
+				for description, findings := range s2 {
+					if existingValues, ok := s[description]; ok {
+						s[description] = append(existingValues, findings...)
+					} else {
+						s[description] = findings
 					}
 				}
 			}
 		}
-		if inline != nil {
-			//Search for secrets in inline scripts
-			text, currUrl, err := getContents(*inline, url)
-			if err != nil {
-				return nil, err
-			}
-			s := getSecrets(*text, flags)
+
+		if s != nil {
 			for description, findings := range s {
 				for _, finding := range findings {
 					var location string
 					if !flags["verify"] {
 						location = ""
 					} else {
-						location = " (Location: " + *currUrl + ")"
+						location = " (Location: " + url + ")"
 					}
-					strings = append(strings, "Possible "+description+" found: "+finding+location)
+					out = append(out, "Possible "+description+" found: "+finding+location)
 				}
 			}
 		}
-
-		return strings, nil
 	} else {
-		//If the dom flag is not set we will get the list of scripts from the HTML response
-		scripts, err := getScripts(url, url)
+		var s []string
+		//getContent can return a nil pointer if the request fails
+		if textString != nil {
+			s, err = getStrings(*textString, flags)
+		}
 		if err != nil {
 			return nil, err
 		}
-		scripts = append(scripts, url) //We will also check the original page, which means inline scripts will be checked as well
 
-		var strings []string
-		if scripts != nil {
-			//For each script source, go to the page and search for secrets
-			for _, script := range scripts {
-				text, currUrl, err := getContents(script, url)
-				if err != nil {
-					return nil, err
-				}
-				//If a URL leads to a non 200 response, text will be nil. Fail and continue to the next URL
-				if text == nil {
-					return nil, nil
-				}
-				s := getSecrets(*text, flags)
-				for description, findings := range s {
-					for _, finding := range findings {
-						var location string
-						if !flags["verify"] {
-							location = ""
-						} else {
-							location = " (Location: " + *currUrl + ")"
-						}
-						strings = append(strings, "Possible "+description+" found: "+finding+location)
+		//Append inline findings to the output as well
+		if inline != nil {
+			s2, err := getStrings(*inline, flags)
+			if err != nil {
+				return nil, err
+			}
+			if s2 != nil {
+				for _, str := range s2 {
+					var location string
+					if !flags["verify"] {
+						location = ""
+					} else {
+						location = " (Location: " + url + ")"
 					}
+					out = append(out, str+location)
 				}
 			}
 		}
-		return strings, nil
+
+		if s != nil {
+			for _, str := range s {
+				var location string
+				if !flags["verify"] {
+					location = ""
+				} else {
+					location = " (Location: " + url + ")"
+				}
+				out = append(out, str+location)
+			}
+		}
 	}
+
+	searchingMsg := fmt.Sprintf("\nSearching %s...\n", url)
+
+	//Lock the outputMutex to prevent multiple goroutines from printing at the same time (searching1, result1, searching2, result2, etc.)
+	outputMutex.Lock()
+	defer outputMutex.Unlock()
+	fmt.Print(searchingMsg)
+	if out != nil {
+		fmt.Println(out)
+	} else {
+		fmt.Println("No results found")
+	}
+	return out, nil
 }
 
-// If secrets is true, then we are looking for secrets, otherwise we are looking for strings
-func run(url string, flags map[string]bool) ([]string, error) {
-	if flags["secrets"] {
-		return secretsCheck(url, flags)
-	} else {
-		return stringsCheck(url, flags)
+// The run function creates goroutines to search the provided URLS for strings or secrets
+//
+// Parameters:
+//   - urlQueue: A pointer to the URLQueue with the input URLs or any found during the search.
+//   - flags: The flags that the user input when using the CLI.
+//
+// Returns:
+//   - error
+//   - Output is printed to stdout in the search function, so no return value is needed.
+func run(urlQueue *URLQueue, flags map[string]bool) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	//Limit the number of concurrent requests to 1 per second
+	limiter := rate.NewLimiter(1, 1)
+
+	pool := pool.NewWithResults[[]string]().WithContext(ctx)
+	for _, url := range urlQueue.queue {
+		err := limiter.Wait(ctx)
+		if err != nil {
+			return err
+		}
+		url := url //Capture the loop variable to make sure it isn't shared between goroutines
+		pool.Go(func(ctx context.Context) ([]string, error) {
+			return search(ctx, url, flags, urlQueue)
+		})
 	}
+
+	_, err := pool.Wait()
+	if err != nil {
+		return err
+	}
+
+	//Output is printed in the search function, in order to output as each goroutine completes rather than after all are finished
+	return nil
 }
 
 func main() {
@@ -614,6 +629,7 @@ func main() {
 				fmt.Println("URLS flag is only available in secrets mode, continuing with only strings")
 			}
 
+			urlQueue := &URLQueue{}
 			if flags["file"] {
 				path := cCtx.Args().First()
 
@@ -627,19 +643,12 @@ func main() {
 				}
 
 				for _, url := range strings.Split(string(file), "\n") {
-					fmt.Print("\nSearching " + url + "\n")
-					strings, err := run(url, flags)
-					if err != nil {
-						return err
-					}
+					urlQueue.Push(url)
+				}
 
-					if len(strings) == 0 {
-						fmt.Println("No results found")
-					}
-
-					for _, str := range strings {
-						fmt.Println(str)
-					}
+				err = run(urlQueue, flags)
+				if err != nil {
+					return err
 				}
 			} else {
 				url := cCtx.Args().First()
@@ -657,17 +666,10 @@ func main() {
 					url = "https://" + url
 				}
 
-				strings, err := run(url, flags)
+				urlQueue.Push(url)
+				err = run(urlQueue, flags)
 				if err != nil {
 					return err
-				}
-
-				if len(strings) == 0 {
-					fmt.Println("No results found")
-				}
-
-				for _, str := range strings {
-					fmt.Println(str)
 				}
 			}
 
